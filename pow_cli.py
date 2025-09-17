@@ -311,12 +311,7 @@ def main():
                     "bestNonce": res.get("nonce"),
                     "bestLeadingZeros": baseline,
                     "challenge": challenge,
-                    "timestamp": int(time.time() * 1000),
-                    "metrics": {
-                        "tested_nonces": tested,
-                        "elapsed_sec": round(dt, 6),
-                        "hashrate_ghs": round(ghs, 3)
-                    }
+                    "timestamp": int(time.time() * 1000)
                 }
                 print(json.dumps(result_obj, ensure_ascii=False, indent=2), flush=True)
 
