@@ -18,10 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 
 # 优先使用 CuPy 后端；失败则回退 Numba 后端
-try:
-    from cupy_pow import mine_gpu
-except Exception:
-    from gpu_pow import mine_gpu
+from cupy_pow import mine_gpu
+
 
 
 # ========= 直接在这里写报警阈值与响铃间隔 =========
