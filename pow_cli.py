@@ -13,17 +13,18 @@ import json
 import argparse
 import sys
 import platform
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 
 # 优先使用 CuPy 后端；失败则回退 Numba 后端
-from cupy_pow import mine_gpu
-
+try:
+    from cupy_pow import mine_gpu
+except Exception:
+    from gpu_pow import mine_gpu
 
 
 # ========= 直接在这里写报警阈值与响铃间隔 =========
-ALERT_THRESHOLD = 43          # 当 baseline >= 该值时，开始持续播放提示音
+ALERT_THRESHOLD = 40          # 当 baseline >= 该值时，开始持续播放提示音
 ALERT_BEEP_INTERVAL = 1.0     # 持续响铃的间隔（秒）
 # =================================================
 OUTPUT_FILE = "1.json"
@@ -63,6 +64,28 @@ def start_alert_beeper():
         t.start()
         _alert_thread_started.set()
 
+# ====================== GH/s 相关的辅助函数 ======================
+
+def _infer_tested_nonces(res: dict | None, default_val: int) -> int:
+    """
+    从 mine_gpu 的返回里尽可能推断本批实际参与计算的 nonce 数。
+    若无可用字段，则退回 default_val（通常是 batch/count）。
+    """
+    if not isinstance(res, dict):
+        return int(default_val)
+    for k in ("tested_nonces", "tested", "checked", "total_nonces"):
+        v = res.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v)
+    return int(default_val)
+
+def _calc_ghs(tested_nonces: int, seconds: float) -> float:
+    if seconds <= 0:
+        return 0.0
+    return float(tested_nonces) / seconds / 1e9
+
+# ===============================================================
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -90,7 +113,7 @@ def main():
     if not args.stream and args.threshold is None:
         args.stream = True
 
-    # HTTP 服务模式（保持原样；该模式下 txid/vout 由 HTTP 请求体提供）
+    # HTTP 服务模式
     if args.serve:
         default_blocks = args.blocks
         default_tpb = args.tpb
@@ -176,10 +199,16 @@ def main():
                     try:
                         with state_lock:
                             current_key['value'] = key
+
+                        # 统计整体平均算力
+                        total_tested = 0
+                        total_elapsed = 0.0
+
                         current = start
                         batches_run = 0
                         print(f"[JOB START] key={key} challenge={challenge_} threshold={int(threshold_)} start={start} count={count} blocks={blocks} tpb={tpb}")
                         while True:
+                            t0 = time.perf_counter()
                             res = mine_gpu(
                                 challenge=challenge_,
                                 threshold_bits=int(threshold_),
@@ -188,10 +217,23 @@ def main():
                                 blocks=blocks,
                                 threads_per_block=tpb,
                             )
+                            dt = time.perf_counter() - t0
+                            tested = _infer_tested_nonces(res, count)
+                            inst_ghs = _calc_ghs(tested, dt)
+
+                            total_tested += tested
+                            total_elapsed += dt
+                            avg_ghs = _calc_ghs(total_tested, total_elapsed)
+
                             batches_run += 1
+                            try:
+                                print(f"[JOB BATCH] key={key} tested={tested} dt={dt:.3f}s inst={inst_ghs:.2f} GH/s avg={avg_ghs:.2f} GH/s")
+                            except Exception:
+                                pass
+
                             if res and res.get('leading_zero_bits', 0) >= int(threshold_):
                                 try:
-                                    print(f"[JOB DONE] key={key} batches_run={batches_run} nonce={res.get('nonce')} lz={res.get('leading_zero_bits')}")
+                                    print(f"[JOB DONE] key={key} batches_run={batches_run} nonce={res.get('nonce')} lz={res.get('leading_zero_bits')} avg={avg_ghs:.2f} GH/s")
                                 except Exception:
                                     pass
                                 cache[key] = {
@@ -199,7 +241,11 @@ def main():
                                     'challenge': challenge_,
                                     'params': {'txid': txid_, 'vout': vout_, 'threshold': int(threshold_)},
                                     'result': res,
-                                    'batches_run': batches_run
+                                    'batches_run': batches_run,
+                                    'hashrate_ghs': {
+                                        'instant': round(inst_ghs, 3),
+                                        'average': round(avg_ghs, 3)
+                                    }
                                 }
                                 save_cache()
                                 try:
@@ -236,7 +282,10 @@ def main():
         baseline = int(args.baseline)
         current = int(args.start)
         batch = int(args.batch)
+
+        # 平滑显示：最近 N 批的平均（可选）
         while True:
+            t0 = time.perf_counter()
             res = mine_gpu(
                 challenge=challenge,
                 threshold_bits=baseline,
@@ -245,7 +294,12 @@ def main():
                 blocks=args.blocks,
                 threads_per_block=args.tpb,
             )
-            print(f"\r[SCAN] current nonce = {current}", end="", flush=True)
+            dt = time.perf_counter() - t0
+            tested = _infer_tested_nonces(res, batch)
+            ghs = _calc_ghs(tested, dt)
+
+            # 覆盖式进度行：包含 GH/s
+            print(f"\r[SCAN] current nonce = {current} | tested={tested} | {ghs:.2f} GH/s", end="", flush=True)
 
             if res and res.get('leading_zero_bits', 0) >= baseline:
                 baseline = int(res['leading_zero_bits'])
@@ -257,7 +311,12 @@ def main():
                     "bestNonce": res.get("nonce"),
                     "bestLeadingZeros": baseline,
                     "challenge": challenge,
-                    "timestamp": int(time.time() * 1000)
+                    "timestamp": int(time.time() * 1000),
+                    "metrics": {
+                        "tested_nonces": tested,
+                        "elapsed_sec": round(dt, 6),
+                        "hashrate_ghs": round(ghs, 3)
+                    }
                 }
                 print(json.dumps(result_obj, ensure_ascii=False, indent=2), flush=True)
 
@@ -276,6 +335,7 @@ def main():
         # 阈值模式
         if args.threshold is None:
             raise SystemExit('缺少 --threshold 或使用 --stream 模式')
+        t0 = time.perf_counter()
         res = mine_gpu(
             challenge=challenge,
             threshold_bits=args.threshold,
@@ -284,12 +344,21 @@ def main():
             blocks=args.blocks,
             threads_per_block=args.tpb,
         )
+        dt = time.perf_counter() - t0
+        tested = _infer_tested_nonces(res, args.count)
+        ghs = _calc_ghs(tested, dt)
+
         print(json.dumps({
             'mode': 'threshold',
             'challenge': challenge,
             'threshold': args.threshold,
-            'result': res
-        }, ensure_ascii=False))
+            'result': res,
+            'metrics': {
+                'tested_nonces': tested,
+                'elapsed_sec': round(dt, 6),
+                'hashrate_ghs': round(ghs, 3)
+            }
+        }, ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':
